@@ -13,13 +13,23 @@ from src.utils.utils import *
 
 class DIP_net(object):
 
-    def __init__(self, image, in_shape, image_name):
+    def __init__(self, image, in_shape, image_name, true_in_shape):
         self.dtype = torch.cuda.FloatTensor
         self.in_shape = in_shape
-        self.x = image
-        self.channels, self.n1, self.n2 = image.shape
-        self.n = self.n1*self.n2
-        self.x_flat = np.reshape(self.x, [1, self.n])
+        self.true_in_shape = true_in_shape
+        if(not np.array_equal(in_shape, true_in_shape)):
+            self.x = self.pad_image(image, in_shape, true_in_shape)
+            self.channels = 1
+            self.n1, self.n2 = in_shape
+            self.n = self.n1 * self.n2
+            self.x_flat = np.reshape(self.x, [1, self.n])
+        else:
+            self.x = image
+            self.channels, self.n1, self.n2 = image.shape
+            self.n = self.n1 * self.n2
+            self.x_flat = np.reshape(self.x, [1, self.n])
+        self.x_hat_var = Variable(torch.zeros(1 * self.in_shape).type(self.dtype), requires_grad=True)
+        self.x_hat_var.data.normal_().type(self.dtype)
         self.net_input, self.net = self.build_network()
         self.loss = self.define_loss()
         self.iter = 0
@@ -44,7 +54,8 @@ class DIP_net(object):
                    need_sigmoid=True, need_bias=True, pad=pad, act_fun='LeakyReLU').type(self.dtype)
 
         net = net.type(self.dtype)
-        net_input = get_noise(input_depth, INPUT, self.in_shape).type(self.dtype)
+
+        net_input = get_noise(input_depth, INPUT, self.true_in_shape).type(self.dtype)
 
         return net_input, net
 
@@ -52,7 +63,7 @@ class DIP_net(object):
         mse = torch.nn.MSELoss().type(self.dtype)
         return mse
 
-    def reconstruct(self, A_type, reconstruct_mode, mn_ratio, num_iter, save_flag):
+    def reconstruct(self, A_type, reconstruct_mode, mn_ratio, num_iter_DIP, num_iter_RED, save_flag, reconstruct_strategy):
         self.iter = 0
         self.A = self.get_A(mn_ratio, A_type)
         self.measurement = self.get_measurement(A_type, reconstruct_mode)
@@ -60,8 +71,30 @@ class DIP_net(object):
         self.optimize_setup()
         p = get_params(self.OPT_OVER, self.net, self.net_input)
         optimize_function_params = (A_type, mn_ratio, reconstruct_mode, save_flag)
-        losses, img_losses = optimize(self.OPTIMIZER, p, self.optimize_function,
-                                      self.LR, num_iter, *optimize_function_params)
+
+        if(reconstruct_strategy == 'normal'):
+            losses, img_losses = optimize(self.OPTIMIZER, p, self.optimize_function,
+                                          self.LR, num_iter_DIP, *optimize_function_params)
+
+        elif(reconstruct_strategy == 'projections'):
+
+            parameters = ([self.x_hat_var], p)
+            LR = (self.LR_RED, self.LR)
+            optimize_functions = (self.optimize_function_RED, self.optimize_function_DIP)
+            params_RED = (A_type, mn_ratio, reconstruct_mode, save_flag)
+            params_DIP = (A_type, mn_ratio, reconstruct_mode, save_flag)
+            optimize_function_params = (params_RED, params_DIP)
+            num_iter = (num_iter_RED, num_iter_DIP)
+            losses_tuple, img_losses_tuple = self.optimize_project(self.OPTIMIZER, parameters, optimize_functions,
+                                                  LR, num_iter, self.num_loops, *optimize_function_params)
+            losses_RED, img_losses_RED = losses_tuple
+            losses_DIP, img_losses_DIP = img_losses_tuple
+
+            losses = losses_RED
+            img_losses = img_losses_RED
+        else:
+            raise NotImplementedError
+
         if(save_flag):
             self.plot_loss_curves(losses, img_losses, A_type, mn_ratio)
 
@@ -80,7 +113,7 @@ class DIP_net(object):
             A = np.fft.fft(np.eye(self.n))  # TODO: might need to divide by sqrt(n) *******
             A = A.reshape(self.n1, 1, self.n)
 
-        elif A_type == "2d_DFT":
+        elif A_type == "2d_DFT" or A_type == "oversampled_2d_DFT_pad":
             self.m = int(self.n1 * mn_ratio)
             A = np.fft.fft(np.eye(self.n1))  # TODO: might need to divide by sqrt(n) *******
             A = A.reshape(self.n1, 1, self.n1)
@@ -124,7 +157,15 @@ class DIP_net(object):
                 y = np.tensordot(self.A, self.x_flat, 2)
                 y = np.abs(y)
 
-            elif (A_type == '2d_DFT' or A_type == 'oversampled_2d_DFT'):    # Note: 2d dft modeled as M*X*M^T
+            elif (A_type == '2d_DFT' or A_type == "oversampled_2d_DFT_pad"):
+                # Note: 2d dft modeled as M*X*M^T
+                y_prime = np.tensordot(self.A, self.x, 2)
+                A_t = np.transpose(np.reshape(self.A, [self.n1, self.n1]))   # TODO: image must be symmetric (not checked)
+                y = np.tensordot(y_prime, A_t, 1)
+                y = np.abs(y)
+
+            elif (A_type == 'oversampled_2d_DFT'):
+                # Note: 2d dft modeled as M*X*M^T
                 y_prime = np.tensordot(self.A, self.x, 2)
                 A_t = np.transpose(np.reshape(self.A, [self.m, self.n1]))   # TODO: image must be symmetric (not checked)
                 y = np.tensordot(y_prime, A_t, 1)
@@ -139,10 +180,10 @@ class DIP_net(object):
 
     def get_measurement_hat(self, out, A_type, reconstruct_mode):
 
-        new_shape = (1, self.n)
-        out_flat = out.view(new_shape)
-
         if (A_type == 'gaussian'):
+            new_shape = (1, self.n)
+            out_flat = out.view(new_shape)
+
             if (reconstruct_mode == 'linear'):
                 measurement_hat = tensordot_pytorch(self.A_var, out_flat, axes=2)
 
@@ -153,6 +194,9 @@ class DIP_net(object):
                 raise NotImplementedError
 
         elif (A_type == 'c_gaussian' or A_type == 'DFT'):
+            new_shape = (1, self.n)
+            out_flat = out.view(new_shape)
+
             if (reconstruct_mode == 'linear'):
                 raise NotImplementedError
 
@@ -162,7 +206,25 @@ class DIP_net(object):
             else:
                 raise NotImplementedError
 
-        elif (A_type == '2d_DFT' or A_type == 'oversampled_2d_DFT' ):   # 2d dft modeled as M*X*M^T
+        elif (A_type == '2d_DFT' or 'oversampled_2d_DFT_pad'):   # 2d dft modeled as M*X*M^T
+            if (reconstruct_mode == 'linear'):
+                raise NotImplementedError
+
+            elif (reconstruct_mode == 'phase-retrieval'):
+                real_A_var_sliced = self.real_A_var.view(self.n1, self.n1)
+                img_A_var_sliced = self.img_A_var.view(self.n1, self.n1)
+
+                r_r_part = tensordot_pytorch(tensordot_pytorch(self.real_A_var, out, axes=2), real_A_var_sliced.transpose(0,1), axes =1)
+                i_i_part = tensordot_pytorch(tensordot_pytorch(self.img_A_var, out, axes=2), img_A_var_sliced.transpose(0,1), axes =1)
+                i_r_part = tensordot_pytorch(tensordot_pytorch(self.img_A_var, out, axes=2), real_A_var_sliced.transpose(0,1), axes =1)
+                r_i_part = tensordot_pytorch(tensordot_pytorch(self.real_A_var, out, axes=2), img_A_var_sliced.transpose(0,1), axes =1)
+
+                measurement_hat = ((r_r_part-i_i_part)**2 + (i_r_part+r_i_part)**2)**(1/2)    # TODO: image must be symmetric (not checked)
+
+            else:
+                raise NotImplementedError
+
+        elif (A_type == 'oversampled_2d_DFT'):   # 2d dft modeled as M*X*M^T
             if (reconstruct_mode == 'linear'):
                 raise NotImplementedError
 
@@ -179,6 +241,7 @@ class DIP_net(object):
 
             else:
                 raise NotImplementedError
+
         else:
             raise NotImplementedError
 
@@ -221,7 +284,7 @@ class DIP_net(object):
         # Add noise to network parameters / network input
         if self.param_noise:
             for n in [x for x in self.net.parameters() if len(x.size()) == 4]:
-                n = n + n.detach().clone().normal_() * n.std() / 50
+                n = n + n.detach().clone().normal_() * n.std() / 50 #50
 
         self.net_input = self.net_input_saved
         if self.reg_noise_std > 0:
@@ -229,6 +292,11 @@ class DIP_net(object):
 
         # Output of network
         out = self.net(self.net_input)
+        if(A_type == 'oversampled_2d_DFT_pad'):
+            pad_shape = (np.asarray(np.shape(self.x)[1:]) - np.asarray(self.true_in_shape)) / 2
+            padvalue = int(pad_shape[0])  # TODO: doesn't check if image is symmetric
+            pad_module = nn.ConstantPad2d(padvalue, 0)
+            out = pad_module(out)
         out_np = torch_to_np(out)
 
         # Calculate measurement estimate |A*net_out|
@@ -238,18 +306,9 @@ class DIP_net(object):
 
         # Define Loss (||A*net_out|-|A*image||l2)
         total_loss = self.loss(measurement_hat, self.measurement_var)
-
-        diff_squared = np.subtract(torch_to_np(measurement_hat), self.measurement)**2
-        sum = np.sum(diff_squared)
-        mse = sum/(np.prod(diff_squared.shape))
-        # print(np.shape(total_loss))
-        # print(total_loss)
-        # print(mse)
         total_loss.backward()
 
         # Record Image Loss (considering x and -x as trivial ambiguities)
-        total_loss_img = np.min([self.loss(out, self.x_var), self.loss(out, self.x_var*-1)])
-
         diff_squared = np.subtract(torch_to_np(out), self.x)**2
         sum = np.sum(diff_squared)
         mse = sum/(np.prod(diff_squared.shape))
@@ -257,7 +316,110 @@ class DIP_net(object):
         sum = np.sum(diff_squared)
         mse2 = sum/(np.prod(diff_squared.shape))
 
-        total_loss_img = np.min([mse,mse2])
+        total_loss_img = np.min([mse, mse2])
+
+        # Print / Save Progress
+        if(save_flag):
+            self.print_progress(out_np, total_loss, A_type, mn_ratio)
+
+        self.iter += 1
+
+        return total_loss/(float(np.prod(measurement_hat.shape))), total_loss_img
+
+
+    def optimize_function_RED(self, A_type, mn_ratio, reconstruct_mode, save_flag):
+
+        # Have x_hat_var fit measurements
+        new_x_hat_shape = (1,) + tuple(self.true_in_shape)
+        x_hat_img = torch_to_np(self.x_hat_var.view(new_x_hat_shape))
+
+        if(A_type == 'oversampled_2d_DFT_pad'):
+            print(self.x_hat_var.shape)
+            pad_shape = (np.asarray(np.shape(self.x)[1:]) - np.asarray(self.true_in_shape)) / 2
+            padvalue = int(pad_shape[0])  # TODO: doesn't check if image is symmetric
+            pad_module = nn.ConstantPad2d(padvalue, 0)
+            out = pad_module(self.x_hat_var)
+            print(out.shape)
+            print('got here')
+        else:
+            out = self.x_hat_var
+
+        # Calculate measurement estimate |A*net_out|
+        measurement_hat = self.get_measurement_hat(out, A_type, reconstruct_mode)
+
+        # Define Loss (||A*net_out|-|A*image||l2)
+        # new_shape = out.shape[1:]  # eliminate unnecessary dimension
+        # out = out.view(new_shape)
+        total_loss = self.loss(measurement_hat, self.measurement_var)
+        # total_loss = self.loss(measurement_hat, self.measurement_var) + self.lambda_var*torch.dot(self.x_hat_var.view(-1), (self.x_hat_var - out).view(-1))
+        # total_loss = self.loss(self.x_hat_var, np_to_torch(self.x).type(self.dtype).view((128, 128)))
+        total_loss.backward()
+
+        # print('difference2', self.loss(out, copy2))
+
+        # Record Image Loss (considering x and -x as trivial ambiguities)
+        print(torch_to_np(out).shape, self.x.shape)
+        diff_squared = np.subtract(torch_to_np(out), self.x)**2
+        sum = np.sum(diff_squared)
+        mse = sum/(np.prod(diff_squared.shape))
+        diff_squared = np.subtract(torch_to_np(out), self.x*-1)**2
+        sum = np.sum(diff_squared)
+        mse2 = sum/(np.prod(diff_squared.shape))
+
+        total_loss_img = np.min([mse, mse2])
+
+        # Print / Save Progress
+        if(save_flag):
+            self.print_progress(x_hat_img.reshape(new_x_hat_shape), total_loss, A_type, mn_ratio)
+
+        self.iter += 1
+
+        return total_loss, total_loss_img
+
+    def optimize_function_DIP(self, A_type, mn_ratio, reconstruct_mode, save_flag):
+
+        # Add noise to network parameters / network input
+        if self.param_noise:
+            for n in [x for x in self.net.parameters() if len(x.size()) == 4]:
+                n = n + n.detach().clone().normal_() * n.std() / 50
+
+        self.net_input = self.net_input_saved
+        if self.reg_noise_std > 0:
+            self.net_input = self.net_input_saved + (self.noise.normal_() * self.reg_noise_std)
+
+        # Output of network + measurement_hat
+        out = self.net(self.net_input)
+        if(A_type == 'oversampled_2d_DFT_pad'):
+            pad_shape = (np.asarray(np.shape(self.x)[1:]) - np.asarray(self.true_in_shape)) / 2
+            padvalue = int(pad_shape[0])  # TODO: doesn't check if image is symmetric
+            pad_module = nn.ConstantPad2d(padvalue, 0)
+            out = pad_module(out)
+        out_np = torch_to_np(out)
+
+        # Calculate measurement estimate |A*net_out|
+        new_shape = out.shape[1:]  # eliminate unnecessary dimension
+        out = out.view(new_shape)
+        measurement_hat = self.get_measurement_hat(out, A_type, reconstruct_mode)
+
+
+        # Define Loss (||net_out-x_hat_var||l2)
+        # total_loss = self.loss(out, self.x_hat_var.detach())
+        # total_loss = self.loss(out, self.x_hat_var.detach())
+        # total_loss = self.loss(measurement_hat, self.measurement_var) + self.lambda_var*torch.dot(self.x_hat_var.detach().view(-1), (self.x_hat_var.detach() - out).view(-1))
+        # total_loss = self.loss(measurement_hat, self.measurement_var) + self.lambda_var*self.loss(out, self.x_hat_var.detach())
+        total_loss = self.loss(measurement_hat, self.measurement_var)
+
+        total_loss.backward()
+
+        # Record Image Loss (considering x and -x as trivial ambiguities)
+        diff_squared = np.subtract(torch_to_np(out), self.x)**2
+        sum = np.sum(diff_squared)
+        mse = sum/(np.prod(diff_squared.shape))
+        diff_squared = np.subtract(torch_to_np(out), self.x*-1)**2
+        sum = np.sum(diff_squared)
+        mse2 = sum/(np.prod(diff_squared.shape))
+
+        total_loss_img = np.min([mse, mse2])
 
         # Print / Save Progress
         if(save_flag):
@@ -279,14 +441,17 @@ class DIP_net(object):
 
         # Optimization Params
         self.OPT_OVER = 'net'
+        self.lambda_var = 0.0001
         self.OPTIMIZER = 'adam'
-        self.NET_TYPE = 'skip_depth6'  # one of skip_depth4|skip_depth2|UNET|ResNet
+        self.NET_TYPE = 'skip_depth4'  # one of skip_depth6|skip_depth4|skip_depth2|UNET|ResNet
+        self.num_loops = 4
 
-        self.LR = 0.01  # learning rate
-        self.param_noise = False  # add noise to net params during optimization
+        self.LR = 0.0001  # 0.001 learning rate
+        self.LR_RED = 0.01
+        self.param_noise = True  # add noise to net params during optimization
         self.show_every = 100
         self.figsize = 5
-        self.reg_noise_std = 0.03  # add noise to net input during optimization
+        self.reg_noise_std = 0.03  # 0.03 add noise to net input during optimization
 
         # Make copies
         self.net_input_saved = self.net_input.detach().clone()
@@ -300,7 +465,8 @@ class DIP_net(object):
             A_var = np_to_torch(self.A, False).type(self.dtype)
             real_A_var = None; img_A_var = None
 
-        elif (A_type == 'c_gaussian' or A_type == 'DFT'  or A_type == '2d_DFT' or A_type == 'oversampled_2d_DFT'):
+        elif (A_type == 'c_gaussian' or A_type == 'DFT'  or A_type == '2d_DFT'
+              or A_type == 'oversampled_2d_DFT' or A_type == 'oversampled_2d_DFT_pad'):
             real_A_var = np_to_torch(np.real(self.A), False).type(self.dtype)
             img_A_var = np_to_torch(np.imag(self.A), False).type(self.dtype)
             A_var = None
@@ -325,11 +491,11 @@ class DIP_net(object):
 
         if self.SAVE and self.iter % self.show_every == 0:
             plt.figure(figsize=(50, 50))
-            plt.imshow(image[0], cmap='gray', interpolation='lanczos')
+            plt.imshow(image[0], cmap='gray')     # TODO: doesn't work for all?
             plt.savefig(full_directory + name)
             plt.close('all')
 
-    def plot_loss_curves(self, losses, img_losses, A_type, mn_ratio): #TODO: not sure if it's plotting MSE or just E
+    def plot_loss_curves(self, losses, img_losses, A_type, mn_ratio):
         if self.SAVE:
             img_directory = self.get_full_directory(A_type)
             full_directory = img_directory + "mn_ratio=" + str(mn_ratio) + "/"
@@ -356,11 +522,79 @@ class DIP_net(object):
 
         return full_directory
 
+    def pad_image(self, image, final_shape, in_shape):
+        pad_shape = (np.asarray(final_shape) - np.asarray(in_shape)) / 2
+        padvalue = int(pad_shape[0])
+        image_out = np.reshape(image, image.shape[1:])
+        image_out = np.pad(image_out, padvalue, 'constant')
+        image_out_shape = image_out.shape
+        new_shape = (1, int(image_out_shape[0]), int(image_out_shape[1]))
+        image_out = image_out.reshape(new_shape)
+
+        return image_out
+
+
+    def optimize_project(self, optimizer_type, parameters, closure, LR, num_iter, num_loops
+                         , *closure_params):
+        """Runs optimization loop.
+
+        Args:
+            optimizer_type: 'LBFGS' of 'adam'
+            parameters: list of Tensors to optimize over
+            closure: function, that returns loss variable
+            LR: learning rate
+            num_iter: number of iterations
+        """
+        losses_RED = []
+        img_losses_RED = []
+        losses_DIP = []
+        img_losses_DIP = []
+
+        if optimizer_type == 'adam':
+            print('Starting optimization with ADAM')
+            RED_parameters, DIP_parameters = parameters
+            num_iter_RED, num_iter_DIP = num_iter
+            LR_RED, LR_DIP = LR
+            closure_RED, closure_DIP = closure
+            closure_params_RED, closure_params_DIP = closure_params
+            optimizer_RED = torch.optim.Adam(RED_parameters, lr=LR_RED)
+            optimizer_DIP = torch.optim.Adam(DIP_parameters, lr=LR_DIP)
+
+            for k in range(num_loops):
+
+                for j in range(num_iter_DIP):
+
+                    optimizer_DIP.zero_grad()
+                    total_loss, total_loss_img = closure_DIP(*closure_params_DIP)
+                    losses_DIP.append(total_loss)
+                    img_losses_DIP.append(total_loss_img)
+                    optimizer_DIP.step()
+
+                # Initialize x_hat_var at best approx. from DIP
+                out = self.net(self.net_input)
+                new_shape = out.shape[1:]  # eliminate unnecessary dimension
+                out = out.view(new_shape)
+                self.x_hat_var.data = out.data
+
+                for i in range(num_iter_RED):
+                    optimizer_RED.zero_grad()
+                    total_loss, total_loss_img = closure_RED(*closure_params_RED)
+                    losses_RED.append(total_loss)
+                    img_losses_RED.append(total_loss_img)
+                    optimizer_RED.step()
+
+
+        else:
+            assert False
+
+        return (losses_RED, img_losses_RED), (losses_DIP, img_losses_DIP)
+
+
 
 class MNIST_DIP_net(DIP_net):
 
-    def __init__(self, image, in_shape, img_name):
-        super(MNIST_DIP_net, self).__init__(image, in_shape, img_name)
+    def __init__(self, image, in_shape, img_name, true_shape=None):
+        super(MNIST_DIP_net, self).__init__(image, in_shape, img_name, true_shape)
 
     def build_network(self):
 
@@ -397,6 +631,7 @@ class DCGAN_MNIST(nn.Module):
         x = F.tanh(self.conv5(x, output_size=(-1, self.nc, self.output_size, self.output_size)))
 
         return x
+
 
 
 #------------------------------------------------------------------------------

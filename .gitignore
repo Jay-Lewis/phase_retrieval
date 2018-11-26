@@ -6,12 +6,8 @@
 ##---------------
 ## Plots / Data
 ##---------------
-plots/
 data/
-*.png
-*.jpeg
-*.jpg
-*.bmp
+
 
 ##---------------
 ## Pycharm Stuff

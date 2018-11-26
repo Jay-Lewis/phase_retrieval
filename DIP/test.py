@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 # ---------------
 imsize = -1
 img_type = 'grayscale'
-img_path = '../data/common_photos/vase.png'
+img_path = '../data/common_photos/wave.jpg'
 _, img_np = get_image(img_path, imsize, img_type)
 
 
@@ -22,16 +22,15 @@ _, img_np = get_image(img_path, imsize, img_type)
 # Create DIP network / object
 # ---------------
 in_shape = img_np.shape[1:]
-dip = DIP_net(img_np, in_shape)
-
+dip = DIP_net(img_np, in_shape, "who_cares")
 
 
 # ---------------------
-# Phase Retrieval Testing
+# Phase Retrieval Testing  (testing to see if my functions operate correctly for DFT measurements )
 # ---------------
 
 # Test if methods are the same
-A_type = "oversampled_2d_DFT"
+A_type = "oversampled_2d_DFT_pad"
 reconstruct_mode = "phase-retrieval"
 mnratio = 1.0
 
@@ -66,24 +65,33 @@ img_part = torch_to_np(np.reshape(i_r_part+r_i_part, [1,dip.m,dip.m]))
 dft_hat = real_part + 1j*img_part
 
 diff = dip.measurement-measurement_hat
-diff3 = np.absolute(dft_true) - np.absolute(dft_hat)
+diff2 = dft_true - dft_hat
+diff3 = np.absolute(dft_true) - dip.measurement
 
 
 total = np.sum(np.absolute(diff))
 print(total)
 print(total/np.product(np.shape(diff)))
-print(np.sum(np.absolute(dip.measurement))/np.product(np.shape(diff)))
+print(np.sum(np.absolute(dip.measurement))/np.product(np.shape(dip.measurement)))
+
+print(dip.measurement)
+print('--------------------------')
+print(diff)
+print('--------------------------')
+print(np.min(np.abs(dip.measurement)))
+print(np.max(np.abs(diff)))
+
 
 newshape = img_np.shape[1:]
 img_np = img_np.reshape(newshape)
-plt.imshow(diff, vmin=0, vmax = 255, cmap='gray')
+plt.imshow(np.absolute(diff), vmin=0, vmax = 255, cmap='gray')
 plt.show()
 
 
 
-# ---------------------
-# Phase Retrieval Testing
-# ---------------
+# # ---------------------
+# # Phase Retrieval Testing (testing Tensordot of pytorch vs. np.tensordot)
+# # ---------------
 #
 # A_type = "gaussian"
 # reconstruct_mode = "phase-retrieval"
@@ -103,13 +111,13 @@ plt.show()
 #
 # plt.imshow(diff, vmin=0, vmax = 255, cmap='gray')
 # plt.show()
-#
 
 
-# ---------------------
-# Phase Retrieval Testing
-# ---------------
-#
+
+# # ---------------------
+# # Phase Retrieval Testing  (Testing DFT matrix by fft vs. creating matrix and then using Tensordot)
+# # ---------------
+# #
 # # Test if DFT Matrix is correct
 # A_type = "oversampled_2d_DFT"
 # reconstruct_mode = "phase-retrieval"
@@ -120,7 +128,7 @@ plt.show()
 #
 # y_prime = np.tensordot(A, img_np, 2)
 # A_t = np.transpose(np.reshape(A, [dip.m, dip.n1]))
-# fft_hat = np.tensordot(y_prime, A_t, 1)
+# # dft_hat = np.tensordot(y_prime, A_t, 1)
 # # fft_hat = dip.get_measurement(A_type, reconstruct_mode)
 #
 # # DFT by fft
@@ -128,12 +136,12 @@ plt.show()
 # img_np = img_np.reshape(newshape)
 # true_fft = np.fft.fft2(img_np)
 #
-# diff = true_fft - fft_hat
+# diff = true_fft - dft_hat
 #
 # plt.figure()
 # plt.imshow(img_np, cmap='gray')
 # plt.figure()
-# plt.imshow(np.angle(fft_hat), cmap='gray')
+# plt.imshow(np.angle(dft_hat), cmap='gray')
 # plt.figure()
 # plt.imshow(np.angle(true_fft), cmap='gray')
 # plt.figure()

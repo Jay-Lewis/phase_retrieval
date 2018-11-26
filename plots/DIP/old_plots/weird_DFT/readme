@@ -1,0 +1,11 @@
+Problem:
+
+*recover 2D image x from y by optimizing:
+
+||A*G(z)-y||
+
+*1D DFT applied to each column of the image x (as though each column was a separate image)
+
+*All columns are reconstructed as a batch
+
+*oversampling helps (around m = 2n)
